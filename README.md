@@ -1,4 +1,4 @@
-# Samvida
+# Samvida - Generate AEO optimized LLMs.txt for your business
 
 > OpenClaw skill that crawls your business website, fills gaps conversationally, and generates a structured `llms.txt` — the agentic contract that makes your business readable and transactable by AI agents.
 
