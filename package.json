@@ -1,0 +1,8 @@
+{
+  "name": "samvida",
+  "version": "0.1.0",
+  "description": "An OpenClaw skill to generate agentic contracts (llms.txt) for your business. Crawls your website, fills gaps conversationally, and produces a structured agent-optimized llms.txt ready to deploy.",
+  "keywords": ["llms", "llms.txt", "agents", "agentic", "crawl", "ai", "samvida", "contract"],
+  "author": "ngm9",
+  "license": "MIT"
+}
