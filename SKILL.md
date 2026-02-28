@@ -208,27 +208,36 @@ If they say **'deploy'**: proceed to Step 9.
 
 ---
 
-### Step 9 — Deploy to Cloudflare Workers
+### Step 9 — Deploy
 
 **If an existing llms.txt was found during crawl**, warn first:
 > "⚠️ I found an existing llms.txt at **{domain}/llms.txt**. Deploying will replace it. Want to see a diff first, or go ahead?"
 
 Show a simple diff if requested (old vs new, first 20 lines each).
 
-**Ask for credentials in one message:**
-> "To deploy to **{domain}/llms.txt**, I need 3 things from Cloudflare:
+**First, detect the platform** — check the crawl data for CMS detection, or ask:
+> "Which platform is **{domain}** hosted on? (Webflow / Framer / Cloudflare / other)"
+
+Then follow the relevant path below.
+
+---
+
+#### 9a — Cloudflare Workers (any site with Cloudflare DNS)
+
+Best for: any site whose DNS goes through Cloudflare (the orange cloud ☁️ is enabled).
+
+> "To deploy to **{domain}/llms.txt** via Cloudflare Workers, I need 3 things:
 >
-> 1. **API Token** — Cloudflare dashboard → My Profile → API Tokens → Create Token → choose **'Edit Cloudflare Workers'** template
-> 2. **Account ID** — top-right of your Cloudflare dashboard after login
+> 1. **API Token** — Cloudflare dashboard → My Profile → API Tokens → Create Token → **'Edit Cloudflare Workers'** template
+> 2. **Account ID** — top-right of your Cloudflare dashboard
 > 3. **Zone ID** — Cloudflare dashboard → click your domain → right sidebar under 'API'
 >
 > These are only used for this deployment and never stored."
 
-Once you have all three, run:
-
 ```bash
 ~/.virtualenvs/samvida/bin/python3 \
   ~/.openclaw/workspace/samvida/scripts/deploy.py \
+  --provider cloudflare \
   --llms-txt /tmp/samvida_llms.txt \
   --cf-token "{token}" \
   --account-id "{account_id}" \
@@ -236,22 +245,71 @@ Once you have all three, run:
   --domain "{domain}"
 ```
 
-**On success:** report the live URL:
-> "✅ Live at https://{domain}/llms.txt"
+---
 
-**On success:** report the live URL:
-> "✅ Live at https://{domain}/llms.txt"
+#### 9b — Webflow (fully automated)
 
-**On CMS detected** (output contains `SAMVIDA_CMS:{name}`): The Worker deployed fine but the CMS is serving the file directly. Tell the user:
+Best for: sites hosted on Webflow (webflow.io or custom domain via Webflow hosting).
 
-> "The Worker deployed successfully, but your site is on **{CMS}** which serves `/llms.txt` directly from their servers — so it takes priority over the Cloudflare Worker.
+> "To deploy to Webflow, I need your **Webflow Site API Token**:
 >
-> The good news: your generated llms.txt is ready. Here's how to update it in {CMS}:
+> Webflow dashboard → your site → **Site Settings → Integrations → API Access → Generate API Token**
+>
+> Scopes to enable: Assets (Read/Write), Sites (Read), Redirects (Read/Write), Publishing (Publish)
+>
+> Optionally: your **Site ID** (visible in the Webflow dashboard URL — auto-detected if omitted)."
+
+```bash
+~/.virtualenvs/samvida/bin/python3 \
+  ~/.openclaw/workspace/samvida/scripts/deploy.py \
+  --provider webflow \
+  --llms-txt /tmp/samvida_llms.txt \
+  --webflow-token "{token}" \
+  --domain "{domain}"
+  # --site-id "{site_id}"  # optional
+```
+
+**How it works:** Uploads llms.txt to Webflow's CDN → adds a 301 redirect `/llms.txt` → CDN URL → publishes. Agents follow the redirect transparently.
+
+**Note:** Redirect API requires Webflow Basic plan or above. If the user is on Starter, Samvida will output manual redirect steps.
+
+---
+
+#### 9c — Framer (semi-automated)
+
+Best for: sites hosted on Framer. Framer has no public REST API, so Samvida hosts the file externally and guides the user to add a redirect in Framer's dashboard.
+
+> "Framer doesn't have a public API for file hosting, so here's what we'll do:
+> 1. I'll host your llms.txt on GitHub Gist (free, stable, public)
+> 2. You add a one-line redirect rule in Framer — takes about 2 minutes
+>
+> Optional: share your **GitHub token** (github.com/settings/tokens → gist scope only) so I can auto-create the Gist. Otherwise I'll give you the content to paste manually."
+
+```bash
+~/.virtualenvs/samvida/bin/python3 \
+  ~/.openclaw/workspace/samvida/scripts/deploy.py \
+  --provider framer \
+  --llms-txt /tmp/samvida_llms.txt \
+  --domain "{domain}" \
+  --github-token "{github_token}"   # optional
+```
+
+**On completion:** Parse `SAMVIDA_HOSTED_URL:{url}` from script output and share the Gist URL with the user along with the redirect steps.
+
+---
+
+#### 9d — CMS detected (Cloudflare Worker deployed but CMS takes priority)
+
+**On CMS detected** (output contains `SAMVIDA_CMS:{name}`):
+
+> "The Worker deployed successfully, but **{CMS}** is serving `/llms.txt` directly from their servers — so it takes priority over the Worker.
+>
+> Run the right deploy command for your platform:
 > {paste the CMS-specific instructions from the script output}
->
-> _(Coming in a future version of Samvida: direct {CMS} API integration so this happens automatically.)_"
 
-**On other errors:** read the error message from the script — it's human-readable. Relay it directly to the user with a suggested fix.
+---
+
+**On any error:** relay the script's human-readable error message directly with a suggested fix.
 
 ---
 

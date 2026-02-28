@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
 """
-deploy.py — Deploy llms.txt as a Cloudflare Worker.
+deploy.py — Deploy llms.txt to Cloudflare Workers, Webflow, or Framer.
 
 Usage:
+    # Cloudflare Workers (default)
     python3 deploy.py \\
+        --provider cloudflare \\
         --llms-txt /path/to/llms.txt \\
         --cf-token TOKEN \\
         --account-id ACCOUNT_ID \\
         --zone-id ZONE_ID \\
         --domain example.com
 
-Steps:
-    1. Upload Worker script with llms.txt content embedded
-    2. Add (or update) a Worker route for domain/llms.txt
-    3. Verify the file is live with retries
+    # Webflow
+    python3 deploy.py \\
+        --provider webflow \\
+        --llms-txt /path/to/llms.txt \\
+        --webflow-token TOKEN \\
+        --site-id SITE_ID \\
+        --domain example.com
+
+    # Framer (semi-automated — outputs hosted URL + manual steps)
+    python3 deploy.py \\
+        --provider framer \\
+        --llms-txt /path/to/llms.txt \\
+        --domain example.com \\
+        --github-token TOKEN   # optional, for Gist hosting
 """
 
 import sys
 import re
 import time
 import json
+import hashlib
 import argparse
 
 try:
@@ -29,16 +42,27 @@ except ImportError:
     sys.exit(1)
 
 CF_API = "https://api.cloudflare.com/client/v4"
+WF_API = "https://api.webflow.com/v2"
+GH_API = "https://api.github.com"
 
+
+# ──────────────────────────────────────────────
+# Shared helpers
+# ──────────────────────────────────────────────
 
 def domain_slug(domain: str) -> str:
-    """Convert domain to a valid Worker script name slug."""
     return re.sub(r"[^a-z0-9]", "-", domain.lower()).strip("-")
 
 
+def md5(content: str) -> str:
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+# ──────────────────────────────────────────────
+# Cloudflare Workers deploy
+# ──────────────────────────────────────────────
+
 def build_worker_js(llms_txt_content: str) -> str:
-    """Embed llms.txt content into the Worker JS template."""
-    # Escape backticks and ${ for JS template literal safety
     escaped = llms_txt_content.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
     return f"""export default {{
   async fetch(request, env, ctx) {{
@@ -60,10 +84,8 @@ const LLMS_TXT_CONTENT = `{escaped}`;
 """
 
 
-def upload_worker(client: httpx.Client, account_id: str, script_name: str, worker_js: str) -> None:
-    """Upload the Worker script to Cloudflare."""
+def cf_upload_worker(client, account_id, script_name, worker_js):
     url = f"{CF_API}/accounts/{account_id}/workers/scripts/{script_name}"
-
     files = {
         "metadata": (None, json.dumps({
             "main_module": "worker.js",
@@ -71,143 +93,395 @@ def upload_worker(client: httpx.Client, account_id: str, script_name: str, worke
         }), "application/json"),
         "worker.js": ("worker.js", worker_js, "application/javascript+module"),
     }
-
     r = client.put(url, files=files)
     data = r.json()
-
     if r.status_code == 403:
-        print("✖  Permission denied. Your token needs 'Workers Scripts: Edit' permission.")
-        print("   Create a new token using the 'Edit Cloudflare Workers' template.")
+        print("✖  Permission denied. Token needs 'Workers Scripts: Edit' permission.")
         sys.exit(1)
     if r.status_code == 404:
-        print(f"✖  Account not found. Check your Account ID (got 404 for account '{account_id}').")
+        print(f"✖  Account not found. Check your Account ID.")
         sys.exit(1)
     if not data.get("success"):
-        errors = data.get("errors", [])
-        print(f"✖  Worker upload failed: {errors}")
+        print(f"✖  Worker upload failed: {data.get('errors', [])}")
         sys.exit(1)
-
     print(f"  ✓ Worker '{script_name}' uploaded")
 
 
-def add_or_update_route(client: httpx.Client, zone_id: str, domain: str, script_name: str) -> None:
-    """Add a Worker route, or update it if one already exists."""
+def cf_add_route(client, zone_id, domain, script_name):
     pattern = f"{domain}/llms.txt"
     routes_url = f"{CF_API}/zones/{zone_id}/workers/routes"
-
-    # Try to create
     r = client.post(routes_url, json={"pattern": pattern, "script": script_name})
     data = r.json()
-
     if r.status_code == 404:
-        print(f"✖  Zone not found. Check your Zone ID (got 404 for zone '{zone_id}').")
-        print("   Find it: Cloudflare dashboard → click your domain → right sidebar under 'API'.")
+        print(f"✖  Zone not found. Check your Zone ID.")
         sys.exit(1)
-
     if data.get("success"):
         print(f"  ✓ Route added: {pattern}")
         return
-
-    # Check if it's a conflict (route already exists)
     errors = data.get("errors", [])
     is_conflict = any(e.get("code") in (10020, 10026) or "already" in str(e).lower() for e in errors)
-
     if is_conflict:
-        # Find and update the existing route
         r2 = client.get(routes_url)
         routes = r2.json().get("result", [])
         existing = next((ro for ro in routes if ro.get("pattern") == pattern), None)
-
         if existing:
-            route_id = existing["id"]
-            r3 = client.put(f"{routes_url}/{route_id}", json={"pattern": pattern, "script": script_name})
+            r3 = client.put(f"{routes_url}/{existing['id']}", json={"pattern": pattern, "script": script_name})
             if r3.json().get("success"):
                 print(f"  ✓ Route updated: {pattern}")
                 return
-
     print(f"✖  Route setup failed: {errors}")
     sys.exit(1)
 
 
+def deploy_cloudflare(args, llms_txt):
+    domain = args.domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+    script_name = f"samvida-{domain_slug(domain)}"
+    print(f"🚀 Deploying via Cloudflare Workers → {domain}/llms.txt")
+    print(f"   Script: {script_name}")
+
+    headers = {"Authorization": f"Bearer {args.cf_token}", "User-Agent": "samvida/0.1.0"}
+    with httpx.Client(headers=headers, timeout=30) as client:
+        cf_upload_worker(client, args.account_id, script_name, build_worker_js(llms_txt))
+        cf_add_route(client, args.zone_id, domain, script_name)
+
+    success, cms = verify_live(domain)
+    if success:
+        print(f"\n✅ Live at https://{domain}/llms.txt")
+    elif cms:
+        print_cms_instructions(domain, cms)
+    else:
+        print(f"\n⚠️  Deployed but not yet reachable. DNS can take 1–2 min.")
+        print(f"   Try: curl https://{domain}/llms.txt")
+
+
+# ──────────────────────────────────────────────
+# Webflow deploy
+# ──────────────────────────────────────────────
+
+def wf_get_site_id(client, domain):
+    """Find Webflow site ID by matching custom domain."""
+    r = client.get(f"{WF_API}/sites")
+    if r.status_code == 401:
+        print("✖  Webflow token invalid or expired. Check your Site API token.")
+        print("   Webflow dashboard → Site Settings → Integrations → API Access → Generate API Token")
+        sys.exit(1)
+    if not r.json().get("sites"):
+        print("✖  No sites found for this token.")
+        sys.exit(1)
+
+    sites = r.json()["sites"]
+    clean_domain = domain.removeprefix("https://").removeprefix("http://").rstrip("/").lower()
+
+    # Match by custom domain or default subdomain
+    for site in sites:
+        custom_domains = [d.get("url", "").lower().strip("/") for d in site.get("customDomains", [])]
+        default = site.get("shortName", "").lower() + ".webflow.io"
+        if clean_domain in custom_domains or clean_domain == default or clean_domain in default:
+            print(f"  ✓ Found site: '{site['displayName']}' (id: {site['id']})")
+            return site["id"]
+
+    # If site_id was provided directly, use it
+    if args_site_id := getattr(client, "_site_id_override", None):
+        return args_site_id
+
+    print(f"✖  No Webflow site found matching '{clean_domain}'.")
+    print(f"   Sites available: {[s['displayName'] for s in sites]}")
+    print(f"   Pass --site-id explicitly if domain matching fails.")
+    sys.exit(1)
+
+
+def wf_upload_asset(client, site_id, llms_txt, file_hash):
+    """Upload llms.txt to Webflow Assets CDN. Returns CDN URL."""
+    # Step 1: Request pre-signed upload URL
+    r = client.post(f"{WF_API}/sites/{site_id}/assets", json={
+        "fileName": "llms.txt",
+        "fileHash": file_hash,
+    })
+    if r.status_code == 401:
+        print("✖  Webflow token lacks asset upload permission.")
+        sys.exit(1)
+    if r.status_code == 404:
+        print(f"✖  Site ID not found: {site_id}")
+        sys.exit(1)
+    data = r.json()
+
+    upload_url = data.get("uploadUrl")
+    upload_details = data.get("uploadDetails", {})
+    asset_url = data.get("hostedUrl") or data.get("url")
+
+    if not upload_url:
+        print(f"✖  Failed to get upload URL from Webflow: {data}")
+        sys.exit(1)
+
+    # Step 2: POST file to S3 pre-signed URL
+    form_data = {k: (None, v) for k, v in upload_details.items()}
+    form_data["file"] = ("llms.txt", llms_txt.encode(), "text/plain")
+
+    upload_client = httpx.Client(timeout=30)
+    r2 = upload_client.post(upload_url, files=form_data)
+    upload_client.close()
+
+    if r2.status_code not in (200, 201, 204):
+        print(f"✖  S3 upload failed (HTTP {r2.status_code}): {r2.text[:200]}")
+        sys.exit(1)
+
+    print(f"  ✓ llms.txt uploaded to Webflow CDN")
+
+    # Construct asset URL if not returned directly
+    if not asset_url:
+        asset_url = f"https://uploads-ssl.webflow.com/{site_id}/{file_hash}/llms.txt"
+
+    return asset_url
+
+
+def wf_upsert_redirect(client, site_id, domain, target_url):
+    """Add or update a 301 redirect: /llms.txt → CDN asset URL."""
+    redirects_url = f"{WF_API}/sites/{site_id}/redirects"
+    from_path = "/llms.txt"
+
+    # Check for existing redirect
+    r = client.get(redirects_url)
+    existing = None
+    if r.status_code == 200:
+        for redirect in r.json().get("redirects", []):
+            if redirect.get("fromUrl") == from_path:
+                existing = redirect
+                break
+
+    payload = {"fromUrl": from_path, "toUrl": target_url, "statusCode": 301}
+
+    if existing:
+        r2 = client.patch(f"{redirects_url}/{existing['id']}", json=payload)
+        if r2.status_code in (200, 201):
+            print(f"  ✓ Redirect updated: {from_path} → {target_url}")
+            return
+    else:
+        r2 = client.post(redirects_url, json=payload)
+        if r2.status_code in (200, 201):
+            print(f"  ✓ Redirect added: {from_path} → {target_url}")
+            return
+
+    # Fallback: some Webflow plans don't support redirect API — provide manual fallback
+    print(f"  ⚠️  Could not create redirect via API (HTTP {r2.status_code}).")
+    print(f"     Manual step: Webflow dashboard → Site Settings → Publishing → 301 Redirects")
+    print(f"     Add: /llms.txt  →  {target_url}")
+
+
+def wf_publish(client, site_id):
+    """Publish the Webflow site to live."""
+    r = client.post(f"{WF_API}/sites/{site_id}/publish", json={"publishTargets": ["live"]})
+    if r.status_code in (200, 201, 202):
+        print(f"  ✓ Site published to live")
+    else:
+        print(f"  ⚠️  Publish returned HTTP {r.status_code} — you may need to publish manually from the Webflow dashboard.")
+
+
+def deploy_webflow(args, llms_txt):
+    domain = args.domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+    print(f"🚀 Deploying via Webflow API → {domain}/llms.txt")
+
+    headers = {
+        "Authorization": f"Bearer {args.webflow_token}",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "User-Agent": "samvida/0.1.0",
+    }
+
+    with httpx.Client(headers=headers, timeout=30) as client:
+        # Attach site_id override for fallback lookup
+        client._site_id_override = args.site_id
+
+        # Step 1: Get site ID
+        site_id = args.site_id or wf_get_site_id(client, domain)
+
+        # Step 2: Upload asset
+        file_hash = md5(llms_txt)
+        cdn_url = wf_upload_asset(client, site_id, llms_txt, file_hash)
+
+        # Step 3: Redirect /llms.txt → CDN URL
+        wf_upsert_redirect(client, site_id, domain, cdn_url)
+
+        # Step 4: Publish
+        wf_publish(client, site_id)
+
+    # Step 5: Verify (may redirect but that's fine — agents follow redirects)
+    print(f"\n⏳ Verifying redirect is live...")
+    time.sleep(5)
+    try:
+        r = httpx.get(f"https://{domain}/llms.txt", timeout=15, follow_redirects=True)
+        if r.status_code == 200 and "#" in r.text[:10]:
+            print(f"✅ Live at https://{domain}/llms.txt")
+        else:
+            print(f"⚠️  Not yet reachable (HTTP {r.status_code}). Webflow publish can take 1–2 min.")
+            print(f"   Try: curl -L https://{domain}/llms.txt")
+    except Exception:
+        print(f"⚠️  Could not verify. Check https://{domain}/llms.txt in 1–2 min.")
+
+    print(f"\n📋 How this works:")
+    print(f"   {domain}/llms.txt  →  301 redirect  →  Webflow CDN ({cdn_url[:60]}...)")
+    print(f"   Agents follow the redirect transparently and receive text/plain content.")
+
+
+# ──────────────────────────────────────────────
+# Framer deploy (semi-automated)
+# ──────────────────────────────────────────────
+
+def gist_upload(github_token, llms_txt, domain):
+    """Upload llms.txt to GitHub Gist. Returns raw URL."""
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "samvida/0.1.0",
+    }
+    payload = {
+        "description": f"llms.txt for {domain} — generated by Samvida",
+        "public": True,
+        "files": {"llms.txt": {"content": llms_txt}},
+    }
+    r = httpx.post(f"{GH_API}/gists", headers=headers, json=payload, timeout=15)
+    if r.status_code == 201:
+        gist = r.json()
+        raw_url = gist["files"]["llms.txt"]["raw_url"]
+        # Strip the blob commit hash to get the stable URL
+        stable_url = re.sub(r"/raw/[a-f0-9]+/", "/raw/", raw_url)
+        print(f"  ✓ Gist created: {gist['html_url']}")
+        print(f"  ✓ Raw URL: {stable_url}")
+        return stable_url
+    elif r.status_code == 401:
+        print("  ✖  GitHub token invalid. Create one at: https://github.com/settings/tokens")
+        return None
+    else:
+        print(f"  ✖  Gist creation failed (HTTP {r.status_code}): {r.text[:100]}")
+        return None
+
+
+def deploy_framer(args, llms_txt):
+    domain = args.domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+    print(f"🖼  Deploying for Framer site → {domain}/llms.txt")
+    print()
+    print("ℹ️  Framer does not have a public REST API for file hosting or redirect management.")
+    print("   Samvida will host your llms.txt and give you the URL to add as a redirect in Framer.")
+    print()
+
+    hosted_url = None
+
+    # If GitHub token provided, push to Gist
+    if args.github_token:
+        print("📤 Uploading to GitHub Gist for stable hosting...")
+        hosted_url = gist_upload(args.github_token, llms_txt, domain)
+    else:
+        print("💡 Tip: Pass --github-token to auto-host via GitHub Gist.")
+        print("   Or host the file manually (Gist, Pastebin, R2, etc.) and use that URL below.")
+
+    print()
+    if hosted_url:
+        print("=" * 60)
+        print("✅ YOUR LLMS.TXT IS HOSTED AT:")
+        print(f"   {hosted_url}")
+        print("=" * 60)
+        print()
+        print("📋 NEXT STEP — Add a redirect in Framer (2 min):")
+    else:
+        print("📋 NEXT STEP — Host your llms.txt then add a redirect in Framer:")
+
+    print("""
+   1. Open your Framer project
+   2. Click the top-left menu → "Site Settings"
+   3. Go to "General" tab → scroll to "Redirect Rules"
+   4. Click "+ Add Rule"
+   5. Set:
+        From:  /llms.txt
+        To:    <YOUR_HOSTED_URL>
+        Type:  301 (Permanent)
+   6. Click "Save" and then "Publish" your site
+
+   Agents will follow the redirect transparently — no issues with content type.""")
+
+    if hosted_url:
+        print(f"\n   Your hosted URL to paste: {hosted_url}")
+
+    print()
+    print("💡 Alternative: If your Framer domain goes through Cloudflare,")
+    print("   you can use Samvida's Cloudflare Workers deploy instead:")
+    print(f"   python3 deploy.py --provider cloudflare --domain {domain} --cf-token TOKEN ...")
+
+    print(f"\nSAMVIDA_PROVIDER:framer")  # machine-readable signal for SKILL.md
+    if hosted_url:
+        print(f"SAMVIDA_HOSTED_URL:{hosted_url}")
+
+
+# ──────────────────────────────────────────────
+# CMS detection + verification (shared)
+# ──────────────────────────────────────────────
+
 CMS_SIGNATURES = {
-    "framer":      {"header": "server", "value": "framer",      "name": "Framer"},
-    "webflow":     {"header": "x-wf-",  "value": "",            "name": "Webflow"},
-    "squarespace": {"header": "server", "value": "squarespace", "name": "Squarespace"},
-    "shopify":     {"header": "server", "value": "shopify",     "name": "Shopify"},
-    "ghost":       {"header": "server", "value": "ghost",       "name": "Ghost"},
-    "wordpress":   {"header": "x-powered-by", "value": "wordpress", "name": "WordPress"},
+    "framer":      {"header": "server",         "value": "framer",       "name": "Framer"},
+    "webflow":     {"header": "x-wf-",          "value": "",             "name": "Webflow"},
+    "squarespace": {"header": "server",         "value": "squarespace",  "name": "Squarespace"},
+    "shopify":     {"header": "server",         "value": "shopify",      "name": "Shopify"},
+    "ghost":       {"header": "server",         "value": "ghost",        "name": "Ghost"},
+    "wordpress":   {"header": "x-powered-by",  "value": "wordpress",    "name": "WordPress"},
 }
 
 CMS_INSTRUCTIONS = {
     "Framer": """
-  📋 How to update your llms.txt in Framer:
-     1. Open your Framer project
-     2. Go to Site Settings → General → Custom Code (or Pages → llms.txt if you have a custom page)
-     3. If llms.txt is a CMS page: open it, paste the new content, republish
-     4. If it's a static file: go to Site Settings → Hosting → Custom Files, upload the new llms.txt
-     5. Republish your site
+  📋 Your site is hosted on Framer.
+     Run: python3 deploy.py --provider framer --domain {domain} --github-token YOUR_GITHUB_TOKEN
+     This will host your llms.txt and walk you through adding a redirect in Framer.
 """,
     "Webflow": """
-  📋 How to update your llms.txt in Webflow:
-     1. Open your Webflow project → Pages
-     2. Find the /llms.txt static page (or create one: Add Page → Static Page → path: llms.txt)
-     3. Paste the new content into the page body as plain text
-     4. Publish the site
-     Note: Phase 2 of Samvida will support updating this via the Webflow API automatically.
+  📋 Your site is hosted on Webflow.
+     Run: python3 deploy.py --provider webflow --domain {domain} --webflow-token YOUR_TOKEN
+     Get your token: Webflow dashboard → Site Settings → Integrations → API Access
 """,
     "Squarespace": """
-  📋 How to update your llms.txt in Squarespace:
-     1. Go to Settings → Advanced → Code Injection (for simple text)
-     2. Or use Pages → Not Linked → add a page at path /llms.txt
-     3. Paste the content and save
+  📋 How to add llms.txt in Squarespace:
+     1. Pages → Not Linked → Add Page → path: /llms.txt
+     2. Paste content as plain text block
+     3. Save and publish
 """,
     "Shopify": """
-  📋 How to update your llms.txt in Shopify:
+  📋 How to add llms.txt in Shopify:
      1. Online Store → Themes → Edit Code
-     2. Under Templates, look for or create llms.txt.liquid
-     3. Paste the content and save
+     2. Templates → Add template: llms.txt.liquid
+     3. Paste the llms.txt content and save
 """,
     "default": """
-  📋 Your site is managed by a CMS that serves /llms.txt directly.
-     The Cloudflare Worker can't intercept it without proxying enabled.
-
-     Easiest fix: paste the generated llms.txt content directly into your CMS.
-     The file is saved at: /tmp/samvida_llms.txt
+  📋 Your site uses a CMS Samvida can't auto-deploy to yet.
+     Paste the generated llms.txt directly into your CMS at the path /llms.txt.
+     File saved at: /tmp/samvida_llms.txt
 """,
 }
 
 
 def detect_cms(headers: dict) -> str | None:
-    """Detect CMS from response headers. Returns CMS name or None."""
     headers_lower = {k.lower(): v.lower() for k, v in headers.items()}
     for cms_id, sig in CMS_SIGNATURES.items():
         h = sig["header"].lower()
         v = sig["value"].lower()
         if h in headers_lower and (not v or v in headers_lower[h]):
             return sig["name"]
-        # Webflow uses x-wf-* headers
         if cms_id == "webflow" and any(k.startswith("x-wf-") for k in headers_lower):
             return sig["name"]
     return None
 
 
+def print_cms_instructions(domain, cms):
+    instructions = CMS_INSTRUCTIONS.get(cms, CMS_INSTRUCTIONS["default"])
+    print(f"\n⚠️  {domain} is hosted on {cms}.")
+    print(instructions.format(domain=domain))
+    print(f"SAMVIDA_CMS:{cms}")
+
+
 def verify_live(domain: str, retries: int = 8, delay: int = 5):
-    """
-    Poll until llms.txt is live or retries exhausted.
-    Returns (success: bool, cms: str | None)
-    """
     url = f"https://{domain}/llms.txt"
     print(f"  ⏳ Verifying {url} ", end="", flush=True)
-
     last_headers = {}
     for i in range(retries):
         try:
             r = httpx.get(url, timeout=10, follow_redirects=True)
             last_headers = dict(r.headers)
             if r.status_code == 200 and r.text.strip().startswith("#"):
-                # Check if it's OUR content or the old CMS content
-                # Our content starts with "# {domain}" and was just deployed
-                # We detect CMS to warn even on "success" if Worker lost
                 cms = detect_cms(last_headers)
                 if cms:
                     print()
@@ -218,19 +492,33 @@ def verify_live(domain: str, retries: int = 8, delay: int = 5):
             pass
         print(".", end="", flush=True)
         time.sleep(delay)
-
     print()
-    cms = detect_cms(last_headers)
-    return False, cms
+    return False, detect_cms(last_headers)
 
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Deploy llms.txt via Cloudflare Workers")
+    parser = argparse.ArgumentParser(description="Deploy llms.txt to Cloudflare, Webflow, or Framer")
+    parser.add_argument("--provider", choices=["cloudflare", "webflow", "framer"], default="cloudflare",
+                        help="Deployment target (default: cloudflare)")
     parser.add_argument("--llms-txt", required=True, help="Path to llms.txt file")
-    parser.add_argument("--cf-token", required=True, help="Cloudflare API token")
-    parser.add_argument("--account-id", required=True, help="Cloudflare Account ID")
-    parser.add_argument("--zone-id", required=True, help="Cloudflare Zone ID")
-    parser.add_argument("--domain", required=True, help="Domain e.g. utkrusht.ai")
+    parser.add_argument("--domain", required=True, help="Your domain e.g. example.com")
+
+    # Cloudflare
+    parser.add_argument("--cf-token", help="Cloudflare API token (Workers deploy)")
+    parser.add_argument("--account-id", help="Cloudflare Account ID")
+    parser.add_argument("--zone-id", help="Cloudflare Zone ID")
+
+    # Webflow
+    parser.add_argument("--webflow-token", help="Webflow Site API token")
+    parser.add_argument("--site-id", help="Webflow Site ID (optional — auto-detected from domain)")
+
+    # Framer / Gist hosting
+    parser.add_argument("--github-token", help="GitHub token for Gist hosting (Framer provider)")
+
     args = parser.parse_args()
 
     # Read llms.txt
@@ -240,43 +528,21 @@ def main():
         print(f"✖  File not found: {args.llms_txt}")
         sys.exit(1)
 
-    domain = args.domain.removeprefix("https://").removeprefix("http://").rstrip("/")
-    script_name = f"samvida-{domain_slug(domain)}"
+    if args.provider == "cloudflare":
+        if not all([args.cf_token, args.account_id, args.zone_id]):
+            print("✖  Cloudflare deploy requires: --cf-token, --account-id, --zone-id")
+            sys.exit(1)
+        deploy_cloudflare(args, llms_txt)
 
-    print(f"🚀 Deploying llms.txt to {domain}")
-    print(f"   Script name: {script_name}")
+    elif args.provider == "webflow":
+        if not args.webflow_token:
+            print("✖  Webflow deploy requires: --webflow-token")
+            print("   Get it: Webflow dashboard → Site Settings → Integrations → API Access → Generate API Token")
+            sys.exit(1)
+        deploy_webflow(args, llms_txt)
 
-    headers = {
-        "Authorization": f"Bearer {args.cf_token}",
-        "User-Agent": "samvida/0.1.0",
-    }
-
-    with httpx.Client(headers=headers, timeout=30) as client:
-        # Step 1 — Upload Worker
-        worker_js = build_worker_js(llms_txt)
-        upload_worker(client, args.account_id, script_name, worker_js)
-
-        # Step 2 — Add/update route
-        add_or_update_route(client, args.zone_id, domain, script_name)
-
-    # Step 3 — Verify
-    success, cms = verify_live(domain)
-
-    if success:
-        print(f"\n✅ Live at https://{domain}/llms.txt")
-    elif cms:
-        instructions = CMS_INSTRUCTIONS.get(cms, CMS_INSTRUCTIONS["default"])
-        print(f"\n⚠️  Your site is hosted on {cms}, which serves /llms.txt directly.")
-        print("   The Cloudflare Worker was deployed successfully, but {cms}'s origin is taking priority.")
-        print("   This is because your DNS A record points to {cms}'s servers, bypassing Cloudflare's proxy.")
-        print()
-        print(f"SAMVIDA_CMS:{cms}")  # machine-readable signal for SKILL.md to parse
-        print(instructions)
-        print(f"  Your generated llms.txt is ready at: /tmp/samvida_llms.txt")
-    else:
-        print(f"\n⚠️  Deployed but not yet reachable at https://{domain}/llms.txt")
-        print("   DNS propagation can take 1–2 minutes.")
-        print(f"   Try: curl https://{domain}/llms.txt")
+    elif args.provider == "framer":
+        deploy_framer(args, llms_txt)
 
 
 if __name__ == "__main__":
