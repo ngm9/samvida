@@ -87,6 +87,30 @@ Samvida's output includes `## Compliance` and `## Reviews` sections — certific
 
 ---
 
+
+## Requirements
+
+### Runtime
+- **Python 3.9+** with a virtualenv at `~/.virtualenvs/samvida`
+- Install dependencies:
+  ```
+  python3 -m venv ~/.virtualenvs/samvida
+  ~/.virtualenvs/samvida/bin/pip install fastapi uvicorn anthropic httpx
+  ```
+- **OpenClaw workspace** at `~/.openclaw/workspace` (default path — adjust in SKILL.md if yours differs)
+
+### Credentials
+
+| Credential | Required | When |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | ✅ Always | Used by Claude to generate the llms.txt output |
+| Cloudflare API Token + Account ID + Zone ID | ⚡ Deploy only | Only if deploying via Cloudflare Workers |
+| Webflow Site API Token | ⚡ Deploy only | Only if deploying via Webflow |
+
+**Credentials are prompted at runtime and never stored by the skill.**
+
+Crawl and generation work without any deploy credentials — you only need them when you say `deploy`.
+
 ## Deploy
 
 Samvida deploys via Cloudflare Workers — your `llms.txt` is served directly from your domain's edge network, with no CMS changes required.
