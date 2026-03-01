@@ -28,6 +28,8 @@ Every output includes:
 - **`## Pricing`** — enough detail for an agent to qualify a lead
 - **`## FAQs`** — 6–10 inline Q&A pairs written from the agent's user's perspective: "Is this right for me?", "How does X work?", "What does it cost?", "Can I do Y?" — answered without requiring the agent to follow a link
 - **`## Links`** — every link with a description, no bare URLs
+- **`## Compliance`** — certifications and standards (SOC 2, ISO 27001, GDPR, HIPAA, etc.) that agents use as trust signals when recommending vendors in regulated industries
+- **`## Reviews`** — third-party ratings and recognition (G2, ProductHunt, Trustpilot, Gartner, Capterra, awards) so agents can assess credibility without crawling review sites
 - **`## Optional`** — supplementary resources with descriptions, safe to skip under token pressure
 
 ---
@@ -79,6 +81,9 @@ The `## FAQs` section is written from the agent's user's perspective. Questions 
 
 **3. Described links everywhere**
 Every link in `## Links` and `## Optional` has a one-line description. Links without context are dead weight in a token-constrained window.
+
+**4. Trust signals for agent decisions**
+Samvida's output includes `## Compliance` and `## Reviews` sections — certifications, third-party ratings, and professional recognition. When an agent is recommending a vendor to a user in a regulated industry, or comparing two similar products, these signals are the difference between a confident recommendation and a hedge. Agents build trust in your product so their users can too.
 
 ---
 
